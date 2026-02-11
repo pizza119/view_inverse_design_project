@@ -198,7 +198,7 @@ if model is not None:
     col1, col2 = st.columns([1, 1.5])
     
     with col1:
-        st.subheader("📊 성능 비교 (Layer-wise)")
+        st.subheader("📊 성능 비교 (MSE)")
         
         mse_1 = np.mean((pred_1 - true_thickness_nm)**2)
         mse_2 = np.mean((pred_2 - true_thickness_nm)**2)
