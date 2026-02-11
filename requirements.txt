@@ -1,4 +1,5 @@
 streamlit
 torch
 numpy
-matplotlib
+pandas
+plotly

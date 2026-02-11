@@ -1,186 +1,271 @@
+%%writefile app.py
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.graph_objects as go
 
 # ==========================================
-# 1. 모델 클래스 정의 (반드시 있어야 로드 가능)
+# 0. 설정 및 정규화 값
 # ==========================================
+MEAN_THICKNESS = np.array([50.0195, 50.12645, 50.055504, 50.020386, 50.059242, 50.0466, 50.054993, 50.047863])
+STD_THICKNESS = np.array([12.729691, 12.730785, 12.685574, 12.686402, 12.647134, 12.705547, 12.759413, 12.76598])
+DEVICE = torch.device('cpu')
 
-# 맨 처음 y값을 줄 때 예측 x를 내뱉는 MLP(학습시켜야 함)
+# ==========================================
+# 1. 모델 클래스 정의
+# ==========================================
 class InverseNet_PaperSpec(nn.Module):
     def __init__(self, input_dim=201, output_dim=8):
         super(InverseNet_PaperSpec, self).__init__()
-        # 논문 스펙: 은닉층 4개, 뉴런 1000개
-        # Batch Norm과 Dropout은 최신 트렌드를 반영해 추가
         self.model = nn.Sequential(
-            # Layer 1
-            nn.Linear(input_dim, 1000),
-            nn.BatchNorm1d(1000),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Layer 2
-            nn.Linear(1000, 1000),
-            nn.BatchNorm1d(1000),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Layer 3
-            nn.Linear(1000, 1000),
-            nn.BatchNorm1d(1000),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Layer 4
-            nn.Linear(1000, 1000),
-            nn.BatchNorm1d(1000),
-            nn.ReLU(),
-
-            # Output Layer (두께 8개 출력)
+            nn.Linear(input_dim, 1000), nn.BatchNorm1d(1000), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(1000, 1000), nn.BatchNorm1d(1000), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(1000, 1000), nn.BatchNorm1d(1000), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(1000, 1000), nn.BatchNorm1d(1000), nn.ReLU(),
             nn.Linear(1000, output_dim)
         )
+    def forward(self, x): return self.model(x)
 
-    def forward(self, x):
-        return self.model(x)
+class MLP(nn.Module):
+    def __init__(self, input_dim=8, output_dim=201):
+        super(MLP, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 250), nn.ReLU(),
+            nn.Linear(250, 250), nn.ReLU(),
+            nn.Linear(250, 250), nn.ReLU(),
+            nn.Linear(250, 250), nn.ReLU(),
+            nn.Linear(250, output_dim)
+        )
+    def forward(self, x): return self.model(x)
 
-
-# 2. 탠덤 네트워크 정의 (Inverse + Frozen Forward)
 class TandemNet(nn.Module):
     def __init__(self, inverse_model, forward_model):
         super(TandemNet, self).__init__()
         self.inverse_model = inverse_model
         self.forward_model = forward_model
-
-        # Forward Model은 학습하지 않도록 얼리기
-        self.forward_model.eval()
-        for param in self.forward_model.parameters():
-            param.requires_grad = False
-
+        for param in self.forward_model.parameters(): 
+            param.requires_grad = False     
     def forward(self, spectrum):
-        predicted_thickness_norm = self.inverse_model(spectrum) # y -> x_p(정규화 o)
-        reconstructed_spectrum = self.forward_model(predicted_thickness_norm) # x_p(정규화 o)-> y_p
-
-        return predicted_thickness_norm, reconstructed_spectrum # x_p, y_p 출력
-
-    def train(self, mode=True):
-      super(TandemNet, self).train(mode) # 일단 전체를 모드에 맞게 변경
-      self.forward_model.eval()          # 그 다음 Forward만 강제로 eval로 고정
-      return self
-    
-
-# Forward Model (시뮬레이터 대체용)
-# 완전열결 MLP 모델 구현
-class MLP(nn.Module):
-    def __init__(self, input_dim = 8, output_dim =201, hidden_dim_1=250, hidden_dim_2=250, hidden_dim_3=250, hidden_dim_4=250):
-        super(MLP, self).__init__() # 부모 클래스 __init__ 실행
-        self.model = nn.Sequential(
-            # 1번째 층 8 -> 250
-            nn.Linear(input_dim, hidden_dim_1),
-            nn.ReLU(),
-            # 2번째 층 250 -> 250
-            nn.Linear(hidden_dim_1, hidden_dim_2),
-            nn.ReLU(),
-            # 3번째 층 250 -> 250
-            nn.Linear(hidden_dim_2, hidden_dim_3),
-            nn.ReLU(),
-            # 4번째 층 250 -> 250
-            nn.Linear(hidden_dim_3, hidden_dim_4),
-            nn.ReLU(),
-            # 5번째 층 250 -> 201
-            nn.Linear(hidden_dim_4, output_dim)
-        )
-
-        # 가중치 초기화 (논문: Normal dist, mean=0, std=0.1)
-        self._initialize_weights() # 정규분포로 가중치, bios 초기화
-
-    def forward(self, x):
-        return self.model(x)
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0, std=0.1)
-                nn.init.normal_(m.bias, mean=0, std=0.1)
-
+        pred_thick = self.inverse_model(spectrum)
+        recon_spec = self.forward_model(pred_thick)
+        return pred_thick, recon_spec
 
 # ==========================================
-# 2. 모델 로드 함수 (캐싱으로 속도 향상)
+# 2. 모델 로드 함수
 # ==========================================
 @st.cache_resource
 def load_models():
-    device = torch.device('cpu') # 서버에는 GPU가 없을 수 있으니 CPU로
+    f_model = MLP().to(DEVICE)
+    i_model = InverseNet_PaperSpec().to(DEVICE)
+    t_model = TandemNet(i_model, f_model).to(DEVICE)
     
-    # 깡통 모델 생성
-    f_model = MLP().to(device)
-    i_model = InverseNet_PaperSpec().to(device)
-    t_model = TandemNet(i_model, f_model).to(device)
+    path = 'tandem_model_change1.pth' 
     
-    # 가중치 로드 (파일 이름이 정확해야 함!)
-    # 만약 Tandem 안에 Forward가 포함되어 저장됐다면 tandem만 로드해도 됨
     try:
-        t_model.load_state_dict(torch.load('tandem_model_change1.pth', map_location=device))
+        checkpoint = torch.load(path, map_location=DEVICE)
+        t_model.load_state_dict(checkpoint)
     except:
-        st.error("모델 파일을 찾을 수 없습니다. GitHub에 .pth 파일을 올렸는지 확인하세요.")
+        try:
+            # GitHub 배포 환경용 경로
+            checkpoint = torch.load('tandem_model_change1.pth', map_location=DEVICE)
+            t_model.load_state_dict(checkpoint)
+        except:
+            st.error("모델 파일을 찾을 수 없습니다. 경로를 확인해주세요.")
+            return None
     
     t_model.eval()
-    return t_model, device
+    return t_model
 
 # ==========================================
-# 3. 데이터 정규화 값 (하드코딩 추천)
+# 3. 최적화 알고리즘
 # ==========================================
-# Colab에서 print(train_dataset.mean), print(train_dataset.std) 해서 나온 값을 적으세요.
-MEAN_THICKNESS = np.array([50.0195, 50.12645, 50.055504, 50.020386, 50.059242, 50.0466, 50.054993, 50.047863])  
-STD_THICKNESS = np.array([12.729691, 12.730785, 12.685574, 12.686402, 12.647134, 12.705547, 12.759413, 12.76598])  
-
-# ==========================================
-# 4. 메인 화면 (UI)
-# ==========================================
-st.title("🌈 AI Nano-Photonic Inverse Design")
-st.markdown("원하는 **스펙트럼(반사율 패턴)**을 입력하면, AI가 그 구조를 만드는 **나노 박막 두께**를 찾아줍니다.")
-
-# 사이드바 입력
-st.sidebar.header("Target Spectrum 설정")
-target_wl = st.sidebar.slider("중심 파장 (Center Wavelength)", 400, 800, 600)
-width = st.sidebar.slider("반사폭 (Width)", 10, 100, 30)
-
-# 실행 버튼
-if st.button("AI 설계 시작 (Design)"):
-    model, device = load_models()
+def run_neural_adjoint(target_spec, forward_model, steps=200, lr=0.05):
+    batch_size = 100 
+    target_batch = target_spec.repeat(batch_size, 1)
+    rand_x = torch.randn(batch_size, 8).to(DEVICE).requires_grad_(True)
+    optimizer = optim.Adam([rand_x], lr=lr)
     
-    # 1. 가상의 목표 스펙트럼 생성 (Gaussian 형태)
-    wavelengths = np.linspace(400, 800, 201)
-    target_spectrum = np.exp(-((wavelengths - target_wl)**2) / (2 * width**2))
-    
-    # 2. AI 예측 (Tandem Network)
-    # Numpy -> Tensor 변환
-    input_tensor = torch.FloatTensor(target_spectrum).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        # Tandem 모델이 두께와 예상 스펙트럼을 동시에 뱉어줌
-        pred_thickness_norm, recon_spectrum = model(input_tensor)
+    for _ in range(steps):
+        optimizer.zero_grad()
+        pred_spec = forward_model(rand_x)
+        loss = nn.functional.mse_loss(pred_spec, target_batch)
+        loss.backward()
+        optimizer.step()
         
-    # 3. 결과 변환 (정규화 해제)
-    pred_thickness_norm = pred_thickness_norm.cpu().numpy().flatten()
-    final_thickness = (pred_thickness_norm * STD_THICKNESS) + MEAN_THICKNESS
+    with torch.no_grad():
+        final_preds = forward_model(rand_x)
+        losses = torch.mean((final_preds - target_batch)**2, dim=1)
+        best_idx = torch.argmin(losses)
+        
+    return rand_x[best_idx].unsqueeze(0).detach()
+
+def run_hybrid(target_spec, tandem_model, steps=50, lr=0.01):
+    with torch.no_grad():
+        init_x, _ = tandem_model(target_spec)
+    opt_x = init_x.clone().detach().requires_grad_(True)
+    optimizer = optim.Adam([opt_x], lr=lr)
+    forward_model = tandem_model.forward_model
+    for _ in range(steps):
+        optimizer.zero_grad()
+        pred_spec = forward_model(opt_x)
+        loss = nn.functional.mse_loss(pred_spec, target_spec)
+        loss.backward()
+        optimizer.step()
+    return opt_x.detach()
+
+# ==========================================
+# 4. 표 하이라이트 함수
+# ==========================================
+def highlight_best_model(row):
+    target = row['Target']
+    diffs = {
+        'Tandem': abs(row['Tandem'] - target),
+        'Adjoint': abs(row['Adjoint'] - target),
+        'Hybrid': abs(row['Hybrid'] - target)
+    }
+    best_model = min(diffs, key=diffs.get)
+    styles = []
+    for col in row.index:
+        if col == best_model:
+            styles.append('background-color: #D4EDDA; color: #155724; font-weight: bold')
+        else:
+            styles.append('')
+    return styles
+
+# ==========================================
+# 5. UI 및 로직
+# ==========================================
+st.set_page_config(layout="wide", page_title="AI Nano-Optics Lab")
+
+def randomize_callback():
+    new_vals = np.random.uniform(30, 70, 8)
+    for i in range(8):
+        st.session_state[f"slider_{i}"] = float(new_vals[i])
+
+# --- 사이드바 ---
+with st.sidebar:
+    st.header("🎛️ 구조 설정")
+    st.button("🎲 두께 랜덤 설정 (Randomize)", on_click=randomize_callback)
+    st.divider()
+    sliders = []
+    for i in range(8):
+        if f"slider_{i}" not in st.session_state:
+            st.session_state[f"slider_{i}"] = 50.0
+        val = st.slider(f"Layer {i+1} (nm)", 30.0, 70.0, key=f"slider_{i}")
+        sliders.append(val)
+
+# --- 메인 화면 ---
+st.title("🧪 AI Nano-Photonic Inverse Design")
+st.markdown("왼쪽 슬라이더로 **목표 구조**를 설정하면, AI가 **스펙트럼만 보고 구조를 역추적**합니다.")
+
+model = load_models()
+
+if model is not None:
+    # 1. 정답 설정
+    true_thickness_nm = np.array(sliders)
+    true_thick_norm = (true_thickness_nm - MEAN_THICKNESS) / STD_THICKNESS
+    true_tensor = torch.FloatTensor(true_thick_norm).unsqueeze(0).to(DEVICE)
     
-    # 범위 강제 (30~70nm) - 보기 좋게
-    final_thickness = np.clip(final_thickness, 30, 70)
+    # 2. 정답 스펙트럼
+    with torch.no_grad():
+        target_spec_norm = model.forward_model(true_tensor)
     
-    # 4. 결과 출력
-    col1, col2 = st.columns(2)
+    # 3. 예측 수행
+    with torch.no_grad():
+        pred_1_norm, _ = model(target_spec_norm) 
+    pred_2_norm = run_neural_adjoint(target_spec_norm, model.forward_model)
+    pred_3_norm = run_hybrid(target_spec_norm, model)
+    
+    # 4. 결과 복원
+    def denorm(val_norm):
+        val = (val_norm.cpu().numpy().flatten() * STD_THICKNESS) + MEAN_THICKNESS
+        return np.clip(val, 30, 70)
+        
+    pred_1 = denorm(pred_1_norm)
+    pred_2 = denorm(pred_2_norm)
+    pred_3 = denorm(pred_3_norm)
+    
+    # 5. 스펙트럼 재검증
+    with torch.no_grad():
+        spec_1 = model.forward_model(pred_1_norm).cpu().numpy().flatten()
+        spec_2 = model.forward_model(pred_2_norm).cpu().numpy().flatten()
+        spec_3 = model.forward_model(pred_3_norm).cpu().numpy().flatten()
+    target_spec_real = target_spec_norm.cpu().numpy().flatten()
+
+    # --- 시각화 ---
+    col1, col2 = st.columns([1, 1.5])
     
     with col1:
-        st.success("✅ 설계 완료!")
-        st.write("AI가 제안한 8층 두께 (nm):")
-        st.dataframe(final_thickness)
+        st.subheader("📊 성능 비교 (Layer-wise)")
         
+        mse_1 = np.mean((pred_1 - true_thickness_nm)**2)
+        mse_2 = np.mean((pred_2 - true_thickness_nm)**2)
+        mse_3 = np.mean((pred_3 - true_thickness_nm)**2)
+        
+        scores = [mse_1, mse_2, mse_3]
+        best_idx = np.argmin(scores)
+        deltas = [None, None, None]
+        deltas[best_idx] = "Best 👑"
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("1. Tandem", f"{mse_1:.2f}", delta=deltas[0], delta_color="inverse")
+        m2.metric("2. Adjoint", f"{mse_2:.2f}", delta=deltas[1], delta_color="inverse")
+        m3.metric("3. Hybrid", f"{mse_3:.2f}", delta=deltas[2], delta_color="inverse")
+        
+        st.markdown("---")
+        
+        df = pd.DataFrame({
+            "Layer": [f"L{i+1}" for i in range(8)],
+            "Target": true_thickness_nm,
+            "Tandem": pred_1,
+            "Adjoint": pred_2,
+            "Hybrid": pred_3
+        })
+        
+        st.dataframe(
+            df.style.format("{:.1f}", subset=["Target", "Tandem", "Adjoint", "Hybrid"])
+              .apply(highlight_best_model, axis=1), 
+            use_container_width=True,
+            hide_index=True
+        )
+
     with col2:
-        # 5. 그래프 그리기
-        st.write("📊 스펙트럼 비교 검증")
-        fig, ax = plt.subplots()
-        ax.plot(wavelengths, target_spectrum, 'k--', label='Target (Goal)', linewidth=2)
-        ax.plot(wavelengths, recon_spectrum.cpu().numpy().flatten(), 'r-', label='AI Result', linewidth=2)
-        ax.set_xlabel("Wavelength (nm)")
-        ax.set_ylabel("Normalized Response")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
+        st.subheader("📈 스펙트럼 비교")
+        wavelengths = np.linspace(400, 800, 201)
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=wavelengths, y=target_spec_real,
+            name='Goal (Ground Truth)',
+            line=dict(color='black', width=4),
+            opacity=0.3
+        ))
+        fig.add_trace(go.Scatter(
+            x=wavelengths, y=spec_1,
+            name='1. Tandem',
+            line=dict(color='blue', width=2),
+            opacity=0.6 
+        ))
+        fig.add_trace(go.Scatter(
+            x=wavelengths, y=spec_2,
+            name='2. Adjoint',
+            line=dict(color='green', width=2),
+            opacity=0.6
+        ))
+        fig.add_trace(go.Scatter(
+            x=wavelengths, y=spec_3,
+            name='3. Hybrid',
+            line=dict(color='red', width=3),
+            opacity=1.0
+        ))
+        fig.update_layout(
+            xaxis_title="Wavelength (nm)", yaxis_title="Reflectance",
+            margin=dict(l=0, r=0, t=30, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 3D 관련 코드는 모두 삭제되었습니다! (속도 최적화 완료)
